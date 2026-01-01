@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎄 Gesture Xmas Tree | AI Magic</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050a05; font-family: 'Segoe UI', sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* UI Overlay */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10;
+            pointer-events: none;
+            display: flex; flex-direction: column; justify-content: space-between; padding: 20px; box-sizing: border-box;
+        }
+
+        .hud-text {
+            color: #d4af37; /* Metallic Gold */
+            text-shadow: 0 0 10px rgba(212, 175, 55, 0.5);
+            text-transform: uppercase; letter-spacing: 2px;
+        }
+
+        #status { font-size: 1.2rem; font-weight: bold; transition: color 0.3s; }
+        .status-active { color: #ff3333; text-shadow: 0 0 15px red; }
+
+        #controls {
+            pointer-events: auto;
+            background: rgba(0, 20, 10, 0.6);
+            backdrop-filter: blur(10px);
+            padding: 20px; border-radius: 12px;
+            border: 1px solid #d4af37;
+            max-width: 300px;
+        }
+
+        button, input::file-selector-button {
+            background: linear-gradient(45deg, #d4af37, #b8860b);
+            border: none; padding: 10px 20px; color: #000; font-weight: bold;
+            cursor: pointer; border-radius: 4px; margin-top: 10px; width: 100%;
+            transition: transform 0.2s;
+        }
+        button:hover { transform: scale(1.05); }
+
+        /* Webcam feedback (small) */
+        #webcam-preview {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 160px; height: 120px;
+            border: 2px solid #d4af37; border-radius: 8px;
+            transform: scaleX(-1); /* Mirror */
+            opacity: 0.7;
+        }
+
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #d4af37; font-size: 2rem; z-index: 100;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Loading Screen -->
+    <div id="loading">🎅 初始化魔法引擎...</div>
+
+    <!-- 3D Canvas -->
+    <div id="canvas-container"></div>
+
+    <!-- Webcam Video (Hidden for processing, shown in canvas or small box) -->
+    <video id="input-video" style="display:none;" playsinline></video>
+    <canvas id="webcam-preview"></canvas>
+
+    <!-- HUD Interface -->
+    <div id="ui-layer">
+        <div class="hud-text">
+            <h1>Merry Christmas 🎄 AI</h1>
+            <div id="status">等待摄像头...</div>
+            <div style="font-size: 0.8rem; margin-top:10px; opacity: 0.8;">
+                ✊ 握拳：聚合圣诞树 <br>
+                🖐 张开：星散模式 <br>
+                👋 移动：旋转视角 <br>
+                👌 捏合：查看照片
+            </div>
+        </div>
+        
+        <div id="controls">
+            <div class="hud-text" style="font-size: 0.9rem; margin-bottom: 10px;">挂载记忆照片</div>
+            <input type="file" id="photo-upload" multiple accept="image/*">
+            <p style="font-size: 0.7rem; color: #aaa;">支持多选，建议上传正方形图片</p>
+        </div>
+    </div>
+
+    <!-- Libraries -->
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Post Processing -->
+    <script src="https://unpkg.com/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+    <!-- GSAP for Animations -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // --- 配置与状态管理 ---
+        const CONFIG = {
+            particleCount: 400, // 装饰球数量
+            photoCount: 20,     // 照片位数量
+            treeHeight: 30,
+            treeRadius: 12,
+            colors: [0x2F4F4F, 0xB8860B, 0x8B0000, 0xFFFFFF], // 绿, 金, 红, 白
+        };
+
+        const STATE = {
+            mode: 'TREE', // TREE, SCATTER, ZOOM
+            gesture: 'NONE',
+            handX: 0.5,
+            handY: 0.5,
+            targetRotationY: 0,
+            zoomIndex: -1
+        };
+
+        // Three.js 全局变量
+        let scene, camera, renderer, composer;
+        let particles = [], photoPlanes = [];
+        let group; // 包含所有元素的组
+        const textureLoader = new THREE.TextureLoader();
+
+        // 占位图生成
+        const createPlaceholderTexture = (text, color) => {
+            const cvs = document.createElement('canvas');
+            cvs.width = 256; cvs.height = 256;
+            const ctx = cvs.getContext('2d');
+            ctx.fillStyle = color;
+            ctx.fillRect(0,0,256,256);
+            ctx.fillStyle = '#fff';
+            ctx.font = '40px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, 128, 128);
+            return new THREE.CanvasTexture(cvs);
+        };
+
+        // --- 1. 初始化 Three.js 场景 ---
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            
+            // 场景
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x050a05, 0.02);
+
+            // 相机
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 10, 40);
+            camera.lookAt(0, 10, 0);
+
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ReinhardToneMapping;
+            container.appendChild(renderer.domElement);
+
+            // 辉光后期处理 (Cinematic Glow)
+            const renderScene = new THREE.RenderPass(scene, camera);
+            const bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0.2;
+            bloomPass.strength = 1.2; // 强度
+            bloomPass.radius = 0.5;
+
+            composer = new THREE.EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            // 灯光
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+            const pointLight = new THREE.PointLight(0xffd700, 1.5, 100);
+            pointLight.position.set(10, 20, 10);
+            scene.add(pointLight);
+
+            // 核心组
+            group = new THREE.Group();
+            scene.add(group);
+
+            createObjects();
+            
+            // 窗口调整
+            window.addEventListener('resize', onWindowResize, false);
+            
+            // 启动动画循环
+            animate();
+        }
+
+        // --- 2. 创建粒子与照片对象 ---
+        function createObjects() {
+            // 几何体复用
+            const geomSphere = new THREE.SphereGeometry(0.4, 16, 16);
+            const geomBox = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+
+            // 材质复用
+            const matGold = new THREE.MeshStandardMaterial({ color: 0xD4AF37, metalness: 0.8, roughness: 0.2 });
+            const matRed = new THREE.MeshStandardMaterial({ color: 0x8B0000, metalness: 0.3, roughness: 0.4, emissive: 0x330000 });
+            const matGreen = new THREE.MeshStandardMaterial({ color: 0x2F4F4F, roughness: 0.9 });
+
+            // A. 创建装饰粒子
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                const isSphere = Math.random() > 0.3;
+                const mesh = new THREE.Mesh(isSphere ? geomSphere : geomBox, 
+                                            Math.random() > 0.6 ? matGold : (Math.random() > 0.5 ? matRed : matGreen));
+                
+                // 计算圣诞树形态坐标 (圆锥螺旋)
+                const p = i / CONFIG.particleCount;
+                const angle = i * 137.5 * (Math.PI / 180); // 黄金角
+                const y = p * CONFIG.treeHeight;
+                const r = (1 - p) * CONFIG.treeRadius;
+                
+                const treePos = {
+                    x: Math.cos(angle) * r,
+                    y: y - CONFIG.treeHeight/2 + 5,
+                    z: Math.sin(angle) * r
+                };
+
+                // 计算散开形态坐标 (随机)
+                const scatterPos = {
+                    x: (Math.random() - 0.5) * 60,
+                    y: (Math.random() - 0.5) * 40 + 10,
+                    z: (Math.random() - 0.5) * 40
+                };
+
+                // 初始位置设为树
+                mesh.position.set(treePos.x, treePos.y, treePos.z);
+                
+                // 存储元数据
+                mesh.userData = { treePos, scatterPos, type: 'deco' };
+                particles.push(mesh);
+                group.add(mesh);
+            }
+
+            // B. 创建照片平面
+            const planeGeom = new THREE.PlaneGeometry(3, 3);
+            for (let i = 0; i < CONFIG.photoCount; i++) {
+                const mat = new THREE.MeshBasicMaterial({ 
+                    map: createPlaceholderTexture('Photo', '#444'),
+                    side: THREE.DoubleSide
+                });
+                const mesh = new THREE.Mesh(planeGeom, mat);
+
+                // 树形态：围绕表面分布
+                const p = i / CONFIG.photoCount;
+                const angle = i * 45; 
+                const y = p * (CONFIG.treeHeight - 5);
+                const r = (1 - p) * (CONFIG.treeRadius + 1); // 稍微浮出表面
+                
+                const treePos = {
+                    x: Math.cos(angle) * r,
+                    y: y - CONFIG.treeHeight/2 + 5,
+                    z: Math.sin(angle) * r
+                };
+                
+                // 散开形态
+                const scatterPos = {
+                    x: (Math.random() - 0.5) * 50,
+                    y: (Math.random() - 0.5) * 30 + 10,
+                    z: (Math.random() - 0.5) * 30 + 10 // 稍微靠前
+                };
+
+                mesh.position.set(treePos.x, treePos.y, treePos.z);
+                mesh.lookAt(0, treePos.y, 0); // 面向中心
+
+                mesh.userData = { 
+                    treePos, 
+                    scatterPos, 
+                    type: 'photo',
+                    id: i,
+                    originalScale: 1
+                };
+                
+                photoPlanes.push(mesh);
+                group.add(mesh);
+            }
+        }
+
+        // --- 3. 动画与过渡逻辑 (GSAP) ---
+        function transitionTo(newState) {
+            if (STATE.mode === newState && newState !== 'ZOOM') return;
+            
+            console.log(`Transitioning to ${newState}`);
+            STATE.mode = newState;
+            const statusEl = document.getElementById('status');
+
+            if (newState === 'TREE') {
+                statusEl.innerText = "状态: 🎄 圣诞树 (握拳)";
+                statusEl.className = "";
+                
+                // 还原所有粒子
+                particles.forEach(p => {
+                    gsap.to(p.position, { duration: 1.5, x: p.userData.treePos.x, y: p.userData.treePos.y, z: p.userData.treePos.z, ease: "elastic.out(1, 0.5)" });
+                    gsap.to(p.rotation, { duration: 1.5, x: 0, y: 0, z: 0 });
+                });
+                // 还原所有照片
+                photoPlanes.forEach(p => {
+                    gsap.to(p.position, { duration: 1.5, x: p.userData.treePos.x, y: p.userData.treePos.y, z: p.userData.treePos.z, ease: "power2.out" });
+                    gsap.to(p.scale, { duration: 1, x: 1, y: 1, z: 1 });
+                    // 让照片面向中心
+                    const lookAtVec = new THREE.Vector3(0, p.userData.treePos.y, 0);
+                    // 这里我们使用一个临时的Tween来更新lookAt可能比较复杂，简单处理：在update中处理或直接设置结束旋转
+                    // 为简化，直接重置到面向中心（需要计算四元数），这里简化为直接飞回
+                    p.lookAt(0, p.userData.treePos.y, 0); 
+                });
+                
+                gsap.to(group.rotation, { duration: 1, y: 0 }); // 重置整体旋转
+
+            } else if (newState === 'SCATTER') {
+                statusEl.innerText = "状态: ✨ 星散 (张开手掌)";
+                statusEl.className = "status-active";
+
+                particles.forEach(p => {
+                    gsap.to(p.position, { duration: 2, x: p.userData.scatterPos.x, y: p.userData.scatterPos.y, z: p.userData.scatterPos.z, ease: "power2.inOut" });
+                    gsap.to(p.rotation, { duration: 3, x: Math.random()*Math.PI, y: Math.random()*Math.PI, ease: "none", repeat: -1, yoyo: true });
+                });
+                
+                photoPlanes.forEach(p => {
+                    gsap.to(p.position, { duration: 2, x: p.userData.scatterPos.x, y: p.userData.scatterPos.y, z: p.userData.scatterPos.z, ease: "power2.inOut" });
+                    gsap.to(p.scale, { duration: 1, x: 1, y: 1, z: 1 });
+                    gsap.to(p.rotation, { duration: 2, x: 0, y: 0, z: 0 }); // 面向前方
+                });
+            } else if (newState === 'ZOOM') {
+                 statusEl.innerText = "状态: 🖼️ 照片聚焦 (捏合)";
+                 // 找到离相机最近的或随机一张照片放大，其他的推远
+                 const targetIndex = Math.floor(Math.random() * photoPlanes.length);
+                 const targetPhoto = photoPlanes[targetIndex];
+                 
+                 // 相机位置固定，我们将照片移到相机面前
+                 // 世界坐标转为相机前方的坐标
+                 const inFrontOfCamera = new THREE.Vector3(0, 0, -10).applyMatrix4(camera.matrixWorld);
+
+                 photoPlanes.forEach((p, idx) => {
+                     if(idx === targetIndex) {
+                         gsap.to(p.position, { 
+                             duration: 1, 
+                             x: inFrontOfCamera.x, 
+                             y: inFrontOfCamera.y, 
+                             z: inFrontOfCamera.z, 
+                             ease: "power3.out" 
+                        });
+                         gsap.to(p.rotation, { duration: 1, x: camera.rotation.x, y: camera.rotation.y, z: camera.rotation.z });
+                         gsap.to(p.scale, { duration: 1, x: 3, y: 3, z: 3 });
+                     } else {
+                         // 其他照片稍微退后变暗（这里只做位置移动）
+                         gsap.to(p.scale, { duration: 1, x: 0.5, y: 0.5 });
+                     }
+                 });
+            }
+        }
+
+        // --- 4. MediaPipe Hands 集成 ---
+        function initMediaPipe() {
+            const videoElement = document.getElementById('input-video');
+            const previewCanvas = document.getElementById('webcam-preview');
+            const previewCtx = previewCanvas.getContext('2d');
+            
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+
+            hands.onResults((results) => {
+                // 绘制预览
+                previewCtx.save();
+                previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+                previewCtx.drawImage(results.image, 0, 0, previewCanvas.width, previewCanvas.height);
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    drawConnectors(previewCtx, results.multiHandLandmarks[0], HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                    
+                    // 分析手势
+                    analyzeGesture(results.multiHandLandmarks[0]);
+                } else {
+                    // 没有检测到手
+                    // 可以选择自动旋转或保持状态
+                }
+                previewCtx.restore();
+            });
+
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+            
+            cameraUtils.start()
+                .then(() => {
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('status').innerText = "系统就绪 - 请展示手势";
+                })
+                .catch(err => {
+                    document.getElementById('loading').innerText = "摄像头访问失败";
+                    console.error(err);
+                });
+        }
+
+        // 手势分析逻辑
+        function analyzeGesture(landmarks) {
+            // 坐标：landmarks[i].x, .y, .z (Normalized 0-1)
+            
+            // 1. 计算手指状态 (开/合)
+            // 简单的判断：指尖(Tip)到手腕(0)的距离 vs 指关节(PIP)到手腕的距离
+            // Index: 8, Middle: 12, Ring: 16, Pinky: 20. Wrist: 0.
+            
+            const wrist = landmarks[0];
+            const tips = [8, 12, 16, 20];
+            const pips = [6, 10, 14, 18];
+            
+            let extendedFingers = 0;
+            for(let i=0; i<4; i++) {
+                // 简单欧几里得距离平方比较
+                const dTip = distSq(landmarks[tips[i]], wrist);
+                const dPip = distSq(landmarks[pips[i]], wrist);
+                if (dTip > dPip) extendedFingers++;
+            }
+
+            // 拇指判断 (有点特殊，判断x偏移)
+            const thumbTip = landmarks[4];
+            const thumbIp = landmarks[3];
+            // 简化：如果拇指尖远离小指根部
+            if (distSq(thumbTip, landmarks[17]) > 0.05) extendedFingers++;
+
+            // 2. 捏合判断 (拇指与食指距离)
+            const pinchDist = Math.sqrt(distSq(landmarks[4], landmarks[8]));
+            const isPinch = pinchDist < 0.05;
+
+            // 3. 状态机触发
+            let newGesture = STATE.gesture;
+
+            if (isPinch) {
+                newGesture = 'PINCH';
+                if (STATE.mode === 'SCATTER') transitionTo('ZOOM');
+            } else if (extendedFingers <= 1) {
+                newGesture = 'FIST';
+                transitionTo('TREE');
+            } else if (extendedFingers >= 4) {
+                newGesture = 'OPEN';
+                if (STATE.mode !== 'ZOOM') transitionTo('SCATTER'); // ZOOM态需要等待或特定动作退出? 这里简化为只要张开就散开
+                else if (STATE.mode === 'ZOOM') transitionTo('SCATTER'); // 退出放大
+            }
+
+            STATE.gesture = newGesture;
+
+            // 4. 更新交互数据 (用于旋转)
+            // 用手掌中心 (9号点 roughly) 的X坐标控制旋转
+            // 映射 0-1 到 -PI 到 PI
+            const handX = landmarks[9].x; 
+            // 平滑处理
+            STATE.handX += (handX - STATE.handX) * 0.1; 
+            
+            if (STATE.mode === 'SCATTER' && !isPinch) {
+                // 这种映射会让手移动时场景旋转
+                const rot = (STATE.handX - 0.5) * 4; // 灵敏度
+                // 只有手在动的时候才转？或者绝对映射？
+                // 绝对映射比较直观：手在左边，场景往左转
+                gsap.to(group.rotation, { y: rot, duration: 0.5 });
+            }
+        }
+
+        function distSq(p1, p2) {
+            return (p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2;
+        }
+
+        // --- 5. 工具函数与事件 ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // 自动旋转 (仅在Tree模式且没有手势干扰时微转)
+            if (STATE.mode === 'TREE') {
+                group.rotation.y += 0.002;
+            }
+
+            // 粒子自身的浮动动画 (在Scatter模式下)
+            if (STATE.mode === 'SCATTER') {
+                const time = Date.now() * 0.001;
+                particles.forEach((p, i) => {
+                    p.position.y += Math.sin(time + i) * 0.02;
+                });
+            }
+
+            composer.render();
+        }
+
+        // 照片上传处理
+        document.getElementById('photo-upload').addEventListener('change', (e) => {
+            const files = e.target.files;
+            if (!files.length) return;
+
+            Array.from(files).forEach((file, i) => {
+                if (i >= photoPlanes.length) return;
+                
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    const img = new Image();
+                    img.src = evt.target.result;
+                    img.onload = () => {
+                        const tex = new THREE.Texture(img);
+                        tex.needsUpdate = true;
+                        // 替换材质
+                        photoPlanes[i].material.map = tex;
+                        photoPlanes[i].material.needsUpdate = true;
+                    }
+                };
+                reader.readAsDataURL(file);
+            });
+            alert(`已加载 ${Math.min(files.length, photoPlanes.length)} 张照片！做出 "张开手掌" 的手势来看看吧！`);
+        });
+
+        // --- 启动 ---
+        initThree();
+        initMediaPipe();
+
+    </script>
+</body>
+</html>
